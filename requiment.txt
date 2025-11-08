@@ -1,0 +1,5 @@
+# Python依存パッケージ
+# GPU対応のリアルタイム音声変換システム
+# DEPRECATED: requiment.txt -> requirements.txt にリネームしました
+# 旧ファイル: requiment.txt
+# 新しいファイル: requirements.txt

@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ゆっくりボイス変換</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      width: 320px;
+      background-color: #ffffff;
+      color: #333;
+    }
+
+    .container {
+      padding: 20px;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 20px;
+      border-bottom: 2px solid #f0f0f0;
+      padding-bottom: 15px;
+    }
+
+    .header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 5px;
+    }
+
+    .header p {
+      font-size: 12px;
+      color: #666;
+    }
+
+    .status-box {
+      background-color: #f9f9f9;
+      padding: 15px;
+      border-radius: 4px;
+      margin-bottom: 15px;
+      border-left: 4px solid #ddd;
+    }
+
+    .status-box.active {
+      background-color: #f0f8f0;
+      border-left-color: #4CAF50;
+    }
+
+    .status-indicator {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background-color: #ccc;
+      margin-right: 8px;
+      animation: blink 1s infinite;
+    }
+
+    .status-indicator.active {
+      background-color: #4CAF50;
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% {
+        opacity: 1;
+      }
+      50% {
+        opacity: 0.6;
+      }
+    }
+
+    .status-text {
+      font-size: 14px;
+      font-weight: 500;
+    }
+
+    .metrics {
+      font-size: 12px;
+      color: #666;
+      margin-top: 8px;
+      line-height: 1.6;
+    }
+
+    .metrics div {
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .toggle-button {
+      width: 100%;
+      padding: 12px;
+      font-size: 16px;
+      font-weight: 600;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      margin-bottom: 15px;
+    }
+
+    .toggle-button.start {
+      background-color: #4CAF50;
+      color: white;
+    }
+
+    .toggle-button.start:hover {
+      background-color: #45a049;
+    }
+
+    .toggle-button.stop {
+      background-color: #f44336;
+      color: white;
+    }
+
+    .toggle-button.stop:hover {
+      background-color: #da190b;
+    }
+
+    .info-section {
+      background-color: #f9f9f9;
+      padding: 12px;
+      border-radius: 4px;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }
+
+    .info-section h3 {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .speaker-list {
+      list-style: none;
+      padding: 0;
+    }
+
+    .speaker-list li {
+      padding: 4px 0;
+      color: #555;
+      font-size: 12px;
+    }
+
+    .speaker-list li:before {
+      content: "🎙️ ";
+      margin-right: 4px;
+    }
+
+    .backend-status {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      padding: 8px;
+      background-color: #f0f0f0;
+      border-radius: 4px;
+      margin-bottom: 15px;
+    }
+
+    .backend-status.ok {
+      background-color: #f0f8f0;
+    }
+
+    .backend-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: #999;
+      margin-right: 6px;
+    }
+
+    .backend-dot.ok {
+      background-color: #4CAF50;
+    }
+
+    .footer {
+      text-align: center;
+      font-size: 11px;
+      color: #999;
+      margin-top: 15px;
+      padding-top: 10px;
+      border-top: 1px solid #f0f0f0;
+    }
+
+    .error-message {
+      background-color: #ffebee;
+      color: #c62828;
+      padding: 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      margin-bottom: 15px;
+      display: none;
+    }
+
+    .error-message.show {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- ヘッダー -->
+    <div class="header">
+      <h1>🎵 ゆっくりボイス変換</h1>
+      <p>合成音声をリアルタイム変換</p>
+    </div>
+
+    <!-- エラーメッセージ -->
+    <div id="errorMessage" class="error-message"></div>
+
+    <!-- バックエンド状態 -->
+    <div id="backendStatus" class="backend-status">
+      <span><span class="backend-dot"></span><span id="backendText">確認中...</span></span>
+    </div>
+
+    <!-- 状態表示 -->
+    <div id="statusBox" class="status-box">
+      <div>
+        <span class="status-indicator"></span>
+        <span class="status-text" id="statusText">停止中</span>
+      </div>
+      <div id="metricsBox" class="metrics" style="display: none;">
+        <div>
+          <span>処理済みチャンク:</span>
+          <span id="processedChunks">0</span>
+        </div>
+        <div>
+          <span>遅延:</span>
+          <span id="latency">-</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 開始/停止ボタン -->
+    <button id="toggleButton" class="toggle-button start">🎙️ 変換を開始</button>
+
+    <!-- 利用可能な話者 -->
+    <div id="speakersSection" class="info-section" style="display: none;">
+      <h3>対応話者:</h3>
+      <ul id="speakerList" class="speaker-list"></ul>
+    </div>
+
+    <!-- フッター -->
+    <div class="footer">
+      <p>localhost:5000 で バックエンドが起動している必要があります</p>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

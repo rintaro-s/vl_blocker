@@ -1,0 +1,34 @@
+# Requirements for backend (ASCII-only comments to avoid encoding issues)
+# If you have an NVIDIA GPU with CUDA 11.8, install torch with the CUDA wheels:
+#   pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu118
+
+torch==2.1.0
+torchaudio==2.1.0
+torchvision==0.16.0
+
+# Audio processing
+librosa==0.10.1
+soundfile==0.12.1
+scipy==1.11.3
+numpy==1.24.3
+resampy==0.4.2
+
+# Source separation (Demucs)
+demucs==4.0.1
+
+# Web framework
+flask==3.0.0
+flask-cors==4.0.0
+
+# Utilities
+tqdm==4.66.1
+
+# Optional: RVC-related packages (install separately if using RVC models)
+# fairseq==0.12.2
+# pyworld==0.3.4
+
+# Optional (useful for multi-speaker/detection/diarization workflows):
+# pyannote.audio==2.1.1    # speaker diarization / segmentation
+# speechbrain==0.5.12      # some ASR / speaker tools
+# webrtcvad==2.0.10        # voice activity detection
+# pydub==0.25.1            # convenient audio slicing/format conversions

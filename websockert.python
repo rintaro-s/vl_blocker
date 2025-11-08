@@ -1,0 +1,4 @@
+def get_metrics():
+# DEPRECATED: websockert.python -> websocket.py に内容を移動しました
+# 旧ファイル: websockert.python
+# 新しいファイル: websocket.py
