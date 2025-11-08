@@ -6,3 +6,5 @@
 *.wav
 *.mp3
 *.mp4
+__pycache__/convert_video.cpython-310.pyc
+backend/__pycache__/voice_converter.cpython-310.pyc

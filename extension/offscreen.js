@@ -4,7 +4,8 @@
  * 役割：タブ音声のキャプチャ、バックエンドへの送信、変換結果の再生。
  */
 
-const CHUNK_SAMPLES = 4096;
+// RVC フル推論用に 1 秒塊（レイテンシ許容）
+const CHUNK_SAMPLES = 16000; // 16kHz * 1s
 const CAPTURE_SILENCE_GAIN = 0.0001;
 
 let audioContext = null;
@@ -50,7 +51,8 @@ async function startPipeline({ streamId, backendUrl, sampleRate }) {
   }
 
   try {
-    state.backendUrl = backendUrl;
+  // 強制的にフル変換エンドポイントへ差し替え
+  state.backendUrl = backendUrl.replace(/\/process_chunk|\/convert_full|\/convert$/, '/convert_full');
     state.sampleRate = sampleRate;
 
     const constraints = {
@@ -209,7 +211,9 @@ async function transmitChunk(chunk) {
   const payload = chunk.buffer.slice(0);
   const startedAt = performance.now();
 
-  const response = await fetch(state.backendUrl, {
+  // 強制的に RVC ターゲット (zundamon-1) を付与
+  const url = state.backendUrl.includes('?') ? `${state.backendUrl}&target=zundamon-1` : `${state.backendUrl}?target=zundamon-1`;
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/octet-stream',

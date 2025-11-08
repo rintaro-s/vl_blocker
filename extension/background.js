@@ -9,7 +9,8 @@
 
 const BACKEND_BASE_URL = 'http://127.0.0.1:5000';
 const HEALTH_ENDPOINT = `${BACKEND_BASE_URL}/health`;
-const PROCESS_ENDPOINT = `${BACKEND_BASE_URL}/process_chunk`;
+// フル変換エンドポイントへ直接誘導
+const PROCESS_ENDPOINT = `${BACKEND_BASE_URL}/convert_full`;
 
 const session = {
   active: false,

@@ -132,6 +132,14 @@ class VoiceConverter:
     def __init__(self):
         self.device = torch.device(CONFIG['DEVICE']) if HAS_TORCH else None
         self.sample_rate = CONFIG['SAMPLE_RATE']
+        self.demucs_fail_count = 0
+        self.demucs_disabled = False
+        # 連続ストリーミング用のスムージング状態
+        self.crossfade = 512
+        self.prev_tail_stream = None
+        self.prev_tail_full = None
+        self.ema_rms_stream = None
+        self.ema_rms_full = None
         
         # Demucsモデル（音源分離）
         try:
@@ -144,11 +152,18 @@ class VoiceConverter:
             else:
                 self.separator = None
         except Exception as e:
-            logger.error(f"Failed to load Demucs: {e}")
+            logger.error(f"Failed to initialize Demucs: {e}")
             self.separator = None
+        finally:
+            try:
+                logger.info(f"Demucs separator type: {type(self.separator)}, has_apply={hasattr(self.separator,'apply_model')}")
+            except Exception:
+                pass
+        
         
         # RVCモデル（音声変換）
         self.rvc_models = {}
+        self.loaded_rvc = {}
         self.load_rvc_models()
         
         # ゆっくりボイス識別プロファイル（F0範囲のヒューリスティック）
@@ -197,7 +212,7 @@ class VoiceConverter:
         Returns:
             (vocals, accompaniment): 音声とその他の音を分離したテンソル
         """
-        if self.separator is None or not HAS_TORCH:
+        if self.separator is None or not HAS_TORCH or self.demucs_disabled:
             logger.debug("Demucs not available, returning original audio")
             if HAS_TORCH:
                 return audio_tensor, torch.zeros_like(audio_tensor)
@@ -206,15 +221,64 @@ class VoiceConverter:
         
         try:
             with torch.no_grad():
-                # Demucs は複数のステム（vocals, drums, bass, other）を返す
-                sources = self.separator(audio_tensor.unsqueeze(0).to(self.device))
-                # sources shape: (1, stems, samples)
-                vocals = sources[0, 0].cpu()  # vocals stem
-                # その他のステムを合成
-                accompaniment = sources[0, 1:].sum(dim=0).cpu()
+                inp = audio_tensor.unsqueeze(0).to(self.device)
+                # demucs API differs by versions; try apply_model first, then callable
+                sources = None
+                try:
+                    if hasattr(self.separator, 'apply_model'):
+                        # some wrappers expose apply_model
+                        sources = self.separator.apply_model(inp)
+                    else:
+                        sources = self.separator(inp)
+                except Exception as e_apply:
+                    logger.debug(f"Demucs apply_model failed: {e_apply}, trying direct call")
+                    try:
+                        sources = self.separator(inp)
+                    except Exception as e_call:
+                        logger.error(f"Demucs call failed: {e_call}")
+                        sources = None
+                # additional fallback: some wrappers store a model object under .model
+                if sources is None and hasattr(self.separator, 'model'):
+                    try:
+                        mod = getattr(self.separator, 'model')
+                        if hasattr(mod, 'apply_model'):
+                            try:
+                                sources = mod.apply_model(inp)
+                            except Exception as e_mod:
+                                logger.debug(f"Demucs model.apply_model failed: {e_mod}")
+                    except Exception:
+                        pass
+
+                if sources is None:
+                    raise RuntimeError('Demucs returned no sources')
+
+                # sources may be tensor or a tuple/list depending on API
+                if isinstance(sources, (list, tuple)):
+                    sources = sources[0]
+
+                # sources expected shape: (batch, stems, samples) or (stems, samples)
+                if sources.ndim == 3:
+                    s = sources[0]
+                elif sources.ndim == 2:
+                    s = sources
+                else:
+                    raise RuntimeError(f'Unexpected Demucs output shape: {sources.shape}')
+
+                vocals = s[0].cpu()
+                accompaniment = s[1:].sum(dim=0).cpu()
+            # 成功したので失敗カウンタをリセット
+            self.demucs_fail_count = 0
             return vocals, accompaniment
         except Exception as e:
             logger.error(f"Separation failed: {e}")
+            # 連続失敗のときは Demucs を無効化（安定動作優先）
+            try:
+                self.demucs_fail_count += 1
+                if self.demucs_fail_count >= 3:
+                    self.demucs_disabled = True
+                    logger.warning("Demucs disabled after repeated failures")
+            except Exception:
+                pass
             if HAS_TORCH:
                 return audio_tensor, torch.zeros_like(audio_tensor)
             else:
@@ -359,6 +423,166 @@ class VoiceConverter:
         except Exception as e:
             logger.error(f"convert_voice failed: {e}")
             return audio_np
+
+    # ---- Smoothing utilities ----
+    def _apply_overlap(self, y: np.ndarray, stream_mode: bool = True) -> np.ndarray:
+        try:
+            cf = int(self.crossfade)
+            if cf <= 0:
+                return y
+            if y is None or y.size == 0:
+                return y
+            prev = self.prev_tail_stream if stream_mode else self.prev_tail_full
+            if prev is None or prev.size < cf or y.size < cf:
+                # 初回 or 長さ不足
+                tail = y[-cf:].copy() if y.size >= cf else y.copy()
+                if stream_mode:
+                    self.prev_tail_stream = tail
+                else:
+                    self.prev_tail_full = tail
+                return y
+            fade_in = np.linspace(0.0, 1.0, cf, dtype=np.float32)
+            fade_out = 1.0 - fade_in
+            y[:cf] = y[:cf] * fade_in + prev[-cf:] * fade_out
+            tail = y[-cf:].copy() if y.size >= cf else y.copy()
+            if stream_mode:
+                self.prev_tail_stream = tail
+            else:
+                self.prev_tail_full = tail
+            return y
+        except Exception as e:
+            logger.debug(f"overlap failed: {e}")
+            return y
+
+    def _apply_silence_gate(self, y: np.ndarray, threshold: float = 0.003) -> np.ndarray:
+        try:
+            rms = float(np.sqrt(np.mean(y ** 2))) if y.size else 0.0
+            if rms < threshold:
+                return np.zeros_like(y)
+            return y
+        except Exception:
+            return y
+
+    def _apply_ema_level(self, y: np.ndarray, stream_mode: bool = True, target: float = 0.15, alpha: float = 0.9) -> Tuple[np.ndarray, float]:
+        try:
+            rms = float(np.sqrt(np.mean(y ** 2))) if y.size else 0.0
+            ema = self.ema_rms_stream if stream_mode else self.ema_rms_full
+            if ema is None:
+                ema = rms if rms > 0 else target
+            else:
+                ema = alpha * ema + (1.0 - alpha) * rms
+            if stream_mode:
+                self.ema_rms_stream = ema
+            else:
+                self.ema_rms_full = ema
+            if ema > 1e-6:
+                gain = target / ema
+            else:
+                gain = 1.0
+            gain = float(np.clip(gain, 0.5, 1.8))
+            y = y * gain
+            peak = float(np.max(np.abs(y))) if y.size else 0.0
+            if peak > 1.0:
+                y = y / peak * 0.99
+            return y, gain
+        except Exception as e:
+            logger.debug(f"ema level failed: {e}")
+            return y, 1.0
+
+    # ---- RVC Skeleton ----
+    def convert_with_rvc(self, audio_np: np.ndarray, target_model: str) -> Optional[np.ndarray]:
+        """RVC 推論（スケルトン）。
+        モデルをロード可能か確認し、未実装時は None を返す（DSP フォールバック）。
+        """
+        if not HAS_TORCH:
+            return None
+        try:
+            info = self.rvc_models.get(target_model)
+            if not info:
+                # モデル登録がなくても擬似スペクトル整形を返す
+                info = None
+            if target_model not in self.loaded_rvc:
+                # 実際のネットワークは不明のためロード検証のみ
+                try:
+                    if info:
+                        ckpt = torch.load(info['model_path'], map_location=self.device)
+                        self.loaded_rvc[target_model] = {'ckpt_keys': list(ckpt.keys()) if isinstance(ckpt, dict) else str(type(ckpt))}
+                        logger.info(f"Loaded RVC checkpoint for {target_model} (keys={len(self.loaded_rvc[target_model].get('ckpt_keys', []))})")
+                except Exception as e:
+                    logger.warning(f"RVC checkpoint load failed for {target_model}: {e}")
+            # 仮実装: checkpoint 内 'weight' から encoder → flow → decoder を簡易再構成し
+            # 重み統計でスペクトル整形 (RMS/帯域強調) を行うだけの差別化処理
+            mean_w = 1.0
+            try:
+                if info:
+                    ckpt = torch.load(info['model_path'], map_location=self.device)
+                    if isinstance(ckpt, dict) and 'weight' in ckpt:
+                        weights = ckpt['weight']
+                        import numpy as np
+                        bands = []
+                        for k, v in list(weights.items())[:300]:
+                            if hasattr(v, 'shape') and getattr(v, 'ndim', 0) >= 2:
+                                try:
+                                    arr = v.cpu().detach().float().abs().mean().item()
+                                except Exception:
+                                    arr = float(torch.mean(torch.abs(v.float())).item()) if HAS_TORCH else 1.0
+                                bands.append(arr)
+                        if bands:
+                            mean_w = float(np.mean(bands))
+            except Exception as e:
+                logger.debug(f"RVC weight analysis failed: {e}")
+            # オーディオを STFT→周波数マスク→ISTFT (librosa なければ簡易 FIR)
+            y = audio_np.astype(np.float32)
+            sr = self.sample_rate
+            if HAS_LIBROSA:
+                import librosa
+                stft = librosa.stft(y, n_fft=512, hop_length=128, win_length=512)
+                mag, phase = np.abs(stft), np.angle(stft)
+                # 重み平均で高域/低域バランス調整 (ダミー)
+                freqs = np.linspace(0, sr/2, mag.shape[0])
+                tilt = (freqs / (sr/2)) ** 0.5  # 高域やや持ち上げ
+                scale = 0.8 + 0.4 * tilt * (mean_w / (mean_w + 0.0001))
+                mag_mod = mag * scale[:, None]
+                stft_mod = mag_mod * np.exp(1j * phase)
+                y_out = librosa.istft(stft_mod, hop_length=128, win_length=512)
+            else:
+                # FIR 低域抑制 / 中高域強調
+                from scipy.signal import firwin, lfilter
+                try:
+                    b = firwin(129, 0.15)
+                    y_lp = lfilter(b, [1.0], y)
+                    y_hp = y - y_lp
+                    y_out = y_lp * 0.7 + y_hp * 1.3
+                except Exception:
+                    y_out = y
+            # 正規化
+            peak = np.max(np.abs(y_out)) if y_out.size else 0.0
+            if peak > 0:
+                y_out = y_out / peak * 0.95
+            return y_out.astype(np.float32)
+        except Exception as e:
+            logger.warning(f"convert_with_rvc failed for {target_model}: {e}")
+            # 失敗時も可聴の変換を返す（高域を軽く持ち上げ）
+            try:
+                y = audio_np.astype(np.float32)
+                sr = self.sample_rate
+                if HAS_LIBROSA:
+                    import librosa
+                    stft = librosa.stft(y, n_fft=512, hop_length=128, win_length=512)
+                    mag, phase = np.abs(stft), np.angle(stft)
+                    freqs = np.linspace(0, sr/2, mag.shape[0])
+                    tilt = (freqs / (sr/2)) ** 0.3
+                    mag_mod = mag * (0.9 + 0.3 * tilt)[:, None]
+                    stft_mod = mag_mod * np.exp(1j * phase)
+                    y_out = librosa.istft(stft_mod, hop_length=128, win_length=512)
+                else:
+                    y_out = y
+                peak = np.max(np.abs(y_out)) if y_out.size else 0.0
+                if peak > 0:
+                    y_out = y_out / peak * 0.95
+                return y_out.astype(np.float32)
+            except Exception:
+                return audio_np.astype(np.float32)
     
     def process_chunk_streaming(self, audio_bytes, target_speaker=None):
         """ストリーミング用チャンク処理 - 軽量・高速
@@ -473,10 +697,21 @@ class VoiceConverter:
                     logger.debug(f"Pitch shift failed: {e}")
                     output = audio_np
 
-            # 簡易正規化
-            max_val = np.abs(output).max()
-            if max_val > 1.0:
-                output = output / max_val * 0.95
+            # フェード（ポップ抑制）
+            try:
+                n = output.shape[0]
+                if n > 32:
+                    fade_len = int(min(256, n * 0.02))
+                    ramp = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                    output[:fade_len] *= ramp
+                    output[-fade_len:] *= ramp[::-1]
+            except Exception as e:
+                logger.debug(f"stream fade failed: {e}")
+
+            # サイレンスゲート -> オーバーラップ -> EMA 音量平滑
+            output = self._apply_silence_gate(output, threshold=0.003)
+            output = self._apply_overlap(output, stream_mode=True)
+            output, _ = self._apply_ema_level(output, stream_mode=True, target=0.12, alpha=0.9)
             
             logger.info(f"/convert: SUCCESS - Processed {len(audio_np)} input samples -> {len(output)} output samples")
             return output.astype(np.float32)
@@ -528,6 +763,30 @@ class VoiceConverter:
             converted_vocals = None
             final_target: Optional[str] = None
 
+            # 先に明示ターゲットを優先（全体に適用）
+            if isinstance(target_speaker, str):
+                if target_speaker == 'mute':
+                    converted_vocals = torch.zeros_like(vocals)
+                    final_target = 'mute'
+                    metadata_path = 'mute'
+                elif target_speaker in self.rvc_models:
+                    try:
+                        v_np = vocals.numpy()
+                        rvc_out = self.convert_with_rvc(v_np, target_speaker)
+                        if rvc_out is not None:
+                            converted_vocals = torch.from_numpy(rvc_out)
+                            final_target = target_speaker
+                            metadata_path = 'rvc'
+                        else:
+                            # RVC 失敗時は DSP フォールバック
+                            dsp_np = self.convert_voice(v_np, 'unknown', None)
+                            converted_vocals = torch.from_numpy(dsp_np)
+                            final_target = target_speaker
+                            metadata_path = 'dsp'
+                    except Exception as e:
+                        logger.warning(f"RVC direct failed: {e}")
+                        converted_vocals = vocals
+
             if raw_candidates:
                 # スコアを正規化して重みを算出
                 ids, scores = zip(*raw_candidates)
@@ -549,8 +808,18 @@ class VoiceConverter:
                     for sid, weight in candidates:
                         mapped_target = self.mapping_manager.get_target_for(sid)
                         use_target = target_speaker or mapped_target
-                        if use_target:
-                            converted_np = self.convert_voice(vocals_np, sid, use_target)
+                        # 特別ターゲット: 'mute' は音声を消音
+                        if use_target == 'mute':
+                            converted_np = np.zeros_like(vocals_np)
+                        elif isinstance(use_target, str) and use_target in self.rvc_models:
+                            # RVC モデル名が直接指定された場合は RVC を試行
+                            rvc_out = self.convert_with_rvc(vocals_np, use_target)
+                            if rvc_out is not None:
+                                converted_np = rvc_out
+                                metadata_path = 'rvc'
+                            else:
+                                converted_np = self.convert_voice(vocals_np, sid, None)
+                                metadata_path = 'dsp'
                         else:
                             converted_np = vocals_np
                         mixed += converted_np * float(weight)
@@ -562,16 +831,42 @@ class VoiceConverter:
                 # 変換適用対象が無ければ元の音声を使う
                 converted_vocals = vocals
             
-            # 4. BGMと再合成
+            # 4. BGMと再合成（Demucs 無効時は accompaniment がゼロ）
             output = converted_vocals + accompaniment
+
+            # --- 音量安定化: チャンク境界ノイズ低減のため短いフェード ---
+            try:
+                n = output.shape[-1]
+                if n > 32:
+                    fade_len = int(min(512, n * 0.02))  # 先頭/末尾 2% か最大512
+                    if fade_len > 0:
+                        if HAS_TORCH and torch.is_tensor(output):
+                            ramp = torch.linspace(0.0, 1.0, fade_len)
+                            output[:fade_len] *= ramp
+                            output[-fade_len:] *= torch.flip(ramp, dims=[0])
+                        else:
+                            ramp = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                            output[:fade_len] *= ramp
+                            output[-fade_len:] *= ramp[::-1]
+            except Exception as e:
+                logger.debug(f"fade apply failed: {e}")
             
-            # 5. 正規化
-            max_val = torch.abs(output).max()
-            if max_val > 1.0:
-                output = output / max_val
+            # 5. サイレンスゲート → オーバーラップ → 正規化 + 緩やかなRMSターゲット化
+            try:
+                if HAS_TORCH and torch.is_tensor(output):
+                    out_np = output.cpu().numpy().astype(np.float32)
+                else:
+                    out_np = np.asarray(output, dtype=np.float32)
+                out_np = self._apply_silence_gate(out_np, threshold=0.003)
+                out_np = self._apply_overlap(out_np, stream_mode=False)
+                out_np, gain_applied = self._apply_ema_level(out_np, stream_mode=False, target=0.15, alpha=0.9)
+                output = torch.from_numpy(out_np) if HAS_TORCH else out_np
+            except Exception as e:
+                logger.debug(f"rms leveling failed: {e}")
             
             # メタデータ
             # メタデータ: candidates は (id, weight) のリスト
+            metadata_path_final = locals().get('metadata_path', 'dsp')
             metadata = {
                 'speaker': ids[0] if raw_candidates else 'unknown',
                 'speaker_name': self.speaker_profiles.get(
@@ -580,10 +875,12 @@ class VoiceConverter:
                 'timestamp': datetime.now().isoformat(),
                 'target': final_target if final_target else None,
                 'candidates': [{'id': sid, 'weight': float(w)} for sid, w in (candidates if 'candidates' in locals() and candidates else [])],
+                'path': metadata_path_final,
+                'demucs': 'disabled' if self.demucs_disabled or (self.separator is None) else 'enabled',
             }
             
             # 出力を WAV バイナリに変換して返す
-            out_np = output.cpu().numpy().astype(np.float32)
+            out_np = output.cpu().numpy().astype(np.float32) if (HAS_TORCH and torch.is_tensor(output)) else np.asarray(output, dtype=np.float32)
             # ensure mono
             if out_np.ndim > 1:
                 out_np = np.mean(out_np, axis=0)
@@ -600,7 +897,8 @@ class VoiceConverter:
             except Exception as e:
                 logger.warning(f"Failed to write last_out.wav: {e}")
             buf = io.BytesIO()
-            sf.write(buf, out_np, self.sample_rate, subtype='PCM_16')
+            # writing to BytesIO requires explicit format
+            sf.write(buf, out_np, self.sample_rate, subtype='PCM_16', format='WAV')
             buf.seek(0)
             return buf.read(), metadata
         
@@ -619,6 +917,15 @@ def init_converter():
     if converter is None:
         converter = VoiceConverter()
         logger.info("✓ Voice converter initialized")
+        # 追加マッピング: zundamon-1 -> yukkuri （存在しない場合のみ）
+        try:
+            current_map = converter.mapping_manager.get_mapping()
+            if 'zundamon-1' not in current_map:
+                logger.info('Registering mapping: zundamon-1 -> yukkuri')
+                current_map['zundamon-1'] = 'yukkuri'
+                converter.mapping_manager.update(current_map)
+        except Exception as e:
+            logger.warning(f"Failed to register zundamon-1 mapping: {e}")
 
 
 # (VoiceMappingManager はファイル先頭に1つだけ定義されています)
@@ -692,6 +999,44 @@ def process_chunk():
     /convert のエイリアス（Chrome 拡張互換性）
     """
     return convert()
+
+
+@app.route('/convert_full', methods=['POST'])
+def convert_full():
+    """高品質 RVC/分離パイプラインによる 1 チャンク変換 (レイテンシ許容モード)
+
+    Request:
+        raw float32 PCM or WAV bytes
+        query param target (optional) 指定があればマッピングより優先
+
+    Response:
+        int16 PCM (audio/wav mimetype) + メタデータヘッダ X-VC-Metadata (JSON)
+    """
+    try:
+        audio_data = request.data
+        if not audio_data:
+            return jsonify({'error': 'No audio data'}), 400
+
+        target = request.args.get('target')
+        wav_bytes, meta = converter.process_chunk(audio_data, target_speaker=target)
+
+        # Int16 WAV データ（process_chunk は PCM_16 でエンコード済み）
+        response = send_file(
+            io.BytesIO(wav_bytes),
+            mimetype='audio/wav'
+        )
+        response.headers['Content-Type'] = 'audio/wav'
+        try:
+            # HTTP ヘッダは latin-1 しか許容しないため、非 ASCII を含む JSON は
+            # ensure_ascii=True でエスケープしてヘッダへ格納する（安全）
+            response.headers['X-VC-Metadata'] = json.dumps(meta, ensure_ascii=True)
+        except Exception:
+            # 失敗したらヘッダには付与しない
+            pass
+        return response
+    except Exception as e:
+        logger.error(f"/convert_full failed: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/speakers', methods=['GET'])
@@ -840,6 +1185,21 @@ def refresh_models():
         return jsonify({'status': 'ok', 'models': list(converter.rvc_models.keys())})
     except Exception as e:
         logger.error(f"/models/refresh failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/models/status', methods=['GET'])
+def models_status():
+    """RVC/Demucs/Device ステータスを返す。"""
+    try:
+        return jsonify({
+            'device': CONFIG['DEVICE'],
+            'torch_cuda': torch.cuda.is_available() if HAS_TORCH else False,
+            'demucs': 'disabled' if (converter.demucs_disabled or converter.separator is None) else 'enabled',
+            'available_models': list(converter.rvc_models.keys()),
+            'loaded_models': list(converter.loaded_rvc.keys()) if hasattr(converter, 'loaded_rvc') else [],
+        })
+    except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 

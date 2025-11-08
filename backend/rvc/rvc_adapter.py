@@ -1,71 +1,65 @@
-import torch
-import numpy as np
+"""
+RVC adapter helpers.
+
+This module provides a small adapter layer that attempts to run inference
+from either a runnable torch module or a saved state_dict. It is intentionally
+lightweight: if no concrete architecture/inference implementation is present
+in the repository, these helpers will act as graceful no-ops and log useful
+diagnostic information for the user.
+
+Implementers can extend this file to add specific RVC model constructors or
+bridge code to third-party inference utilities.
+"""
 from pathlib import Path
 import logging
-from typing import Optional, List
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
-class RVCManager:
-    """RVC adaptor that expects TorchScript models placed under `models/rvc/<id>.<ext>`.
+def infer_from_state_dict(state_dict: dict, audio_np: np.ndarray, device=None):
+    """Best-effort: attempt to infer from a raw state_dict.
 
-    Supported formats (best-effort):
-    - TorchScript saved module: `models/rvc/<id>.jit` or `<id>.pt` or `<id>.pth` (if TorchScript).
+    Currently this function does not implement a generic RVC loader because
+    architecture details vary across model artifacts. It returns None to
+    indicate that no inference was performed.
 
-    If a model cannot be loaded, the manager leaves it out and convert will fallback to pass-through.
+    You can extend this function to instantiate a known architecture and
+    load the state_dict, then run inference.
     """
+    if not isinstance(state_dict, dict):
+        return None
 
-    def __init__(self, models_dir: Optional[str] = None, device: Optional[torch.device] = None):
-        self.models_dir = Path(models_dir) if models_dir else Path(__file__).parent.parent / 'models' / 'rvc'
-        self.device = device or torch.device('cpu')
-        self.models = {}  # id -> scripted module
-        self.scan_models()
+    logger.info("rvc_adapter: infer_from_state_dict called: keys=%d", len(state_dict.keys()))
 
-    def scan_models(self):
-        if not self.models_dir.exists():
-            logger.info(f"RVC models dir not found: {self.models_dir}")
-            return
-        logger.info(f"Scanning RVC models in {self.models_dir}")
-        for f in sorted(self.models_dir.iterdir()):
-            if not f.is_file():
-                continue
-            name = f.stem
-            if f.suffix.lower() in ('.jit', '.pt', '.pth'):
-                try:
-                    # Try to load as TorchScript
-                    mod = torch.jit.load(str(f), map_location=self.device)
-                    mod.eval()
-                    self.models[name] = mod
-                    logger.info(f"Loaded RVC scripted model: {name} from {f}")
-                except Exception as e:
-                    logger.warning(f"Failed to torch.jit.load {f}: {e}")
+    # Detect placeholders created by the training stub
+    try:
+        # state_dict might actually be raw bytes if the file was a placeholder
+        if isinstance(state_dict, bytes) or any(isinstance(v, (bytes, bytearray)) for v in state_dict.values()):
+            logger.info("rvc_adapter: state_dict contains raw bytes or placeholder; skipping inference")
+            return None
+    except Exception:
+        pass
 
-    def list_models(self) -> List[str]:
-        return list(self.models.keys())
+    # No generic loader implemented here
+    logger.info("rvc_adapter: no generic RVC loader implemented; please provide a runnable model artifact or extend this adapter")
+    return None
 
-    def has_model(self, model_id: str) -> bool:
-        return model_id in self.models
 
-    def infer(self, audio_np: np.ndarray, model_id: str, sr: int = 16000) -> np.ndarray:
-        """Run inference using the scripted model.
-
-        audio_np: 1-D float32 numpy array in [-1,1]
-        returns: 1-D float32 numpy array
-        """
-        if model_id not in self.models:
-            raise RuntimeError(f"Model {model_id} not loaded")
-        mod = self.models[model_id]
+def inspect_module(mod):
+    """Return a short diagnostic dict for a loaded module/object."""
+    info = {
+        'repr': repr(mod)[:200],
+        'has_attrs': {},
+        'dir': []
+    }
+    try:
+        attrs = ['infer', 'forward', '__call__', 'to', 'eval']
+        info['has_attrs'] = {a: hasattr(mod, a) for a in attrs}
         try:
-            # Prepare tensor: (1, samples)
-            x = torch.from_numpy(audio_np.astype(np.float32)).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                out = mod(x)
-            # Accept tensor or tuple results
-            if isinstance(out, (tuple, list)):
-                out = out[0]
-            out_np = out.squeeze(0).cpu().numpy().astype(np.float32)
-            return out_np
-        except Exception as e:
-            logger.error(f"RVC inference failed for {model_id}: {e}")
-            raise
+            info['dir'] = [x for x in dir(mod) if not x.startswith('_')][:40]
+        except Exception:
+            info['dir'] = []
+    except Exception:
+        pass
+    return info
